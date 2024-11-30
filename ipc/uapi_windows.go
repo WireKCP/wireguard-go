@@ -8,8 +8,8 @@ package ipc
 import (
 	"net"
 
+	"github.com/wirekcp/wireguard-go/ipc/namedpipe"
 	"golang.org/x/sys/windows"
-	"golang.zx2c4.com/wireguard/ipc/namedpipe"
 )
 
 // TODO: replace these with actual standard windows error numbers from the win package
@@ -53,7 +53,7 @@ var UAPISecurityDescriptor *windows.SECURITY_DESCRIPTOR
 
 func init() {
 	var err error
-	UAPISecurityDescriptor, err = windows.SecurityDescriptorFromString("O:SYD:P(A;;GA;;;SY)(A;;GA;;;BA)S:(ML;;NWNRNX;;;HI)")
+	UAPISecurityDescriptor, err = windows.SecurityDescriptorFromString("O:BAD:P(A;;GA;;;SY)(A;;GA;;;BA)S:(ML;;NWNRNX;;;HI)")
 	if err != nil {
 		panic(err)
 	}
@@ -62,7 +62,7 @@ func init() {
 func UAPIListen(name string) (net.Listener, error) {
 	listener, err := (&namedpipe.ListenConfig{
 		SecurityDescriptor: UAPISecurityDescriptor,
-	}).Listen(`\\.\pipe\ProtectedPrefix\Administrators\WireGuard\` + name)
+	}).Listen(`\\.\pipe\ProtectedPrefix\Administrators\WireKCP\` + name)
 	if err != nil {
 		return nil, err
 	}
