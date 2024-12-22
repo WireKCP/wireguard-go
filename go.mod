@@ -3,6 +3,7 @@ module github.com/wirekcp/wireguard-go
 go 1.23.1
 
 require (
+	github.com/xtaci/kcp-go/v5 v5.6.20
 	golang.org/x/crypto v0.37.0
 	golang.org/x/net v0.39.0
 	golang.org/x/sys v0.32.0
@@ -12,5 +13,11 @@ require (
 
 require (
 	github.com/google/btree v1.1.2 // indirect
+	github.com/klauspost/cpuid/v2 v2.2.8 // indirect
+	github.com/klauspost/reedsolomon v1.12.4 // indirect
+	github.com/pkg/errors v0.9.1 // indirect
+	github.com/templexxx/cpu v0.1.1 // indirect
+	github.com/templexxx/xorsimd v0.4.3 // indirect
+	github.com/tjfoc/gmsm v1.4.1 // indirect
 	golang.org/x/time v0.7.0 // indirect
 )
