@@ -9,7 +9,6 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"errors"
-	"fmt"
 	"net"
 	"net/netip"
 	"runtime"
@@ -158,7 +157,10 @@ again:
 
 	go func() {
 		for {
-			time.Sleep(10 * time.Millisecond)
+			if s.connKCPs == nil {
+				break
+			}
+			time.Sleep(5 * time.Millisecond)
 			s.mu.Lock()
 			for _, kcpsession := range s.connKCPs {
 				kcpsession.Update()
@@ -242,10 +244,10 @@ func (s *KCPBind) receiveIP(
 		s.mu.Unlock()
 		kcpsession.Input(msg.Buffers[0][:msg.N], true, false)
 		msg.N = kcpsession.Recv(msg.Buffers[0])
-		if msg.N > 0 {
-			fmt.Printf("Data : %x\n", msg.Buffers[0][:msg.N])
-			fmt.Printf("Length : %d\n", msg.N)
-		}
+		// if msg.N > 0 {
+		// 	fmt.Printf("Data : %x\n", msg.Buffers[0][:msg.N])
+		// 	fmt.Printf("Length : %d\n", msg.N)
+		// }
 		sizes[i] = msg.N
 		if sizes[i] == 0 {
 			continue
@@ -285,12 +287,10 @@ func (s *KCPBind) Close() error {
 
 	var err1, err2 error
 	if s.connKCPs != nil {
-		old := s.connKCPs
-		s.connKCPs = make(map[string]*kcp.KCP)
-		for k := range old {
-			delete(old, k)
+		for k := range s.connKCPs {
+			delete(s.connKCPs, k)
 		}
-		old = nil
+		s.connKCPs = nil
 	}
 	if s.ipv4 != nil {
 		err1 = s.ipv4.Close()
@@ -406,7 +406,7 @@ func (s *KCPBind) send(conn *net.UDPConn, pc batchWriter, msgs []ipv6.Message) e
 			break
 		}
 		kcpsession.Input(msg.Buffers[0], true, false)
-		fmt.Printf("Data : %x\n", msg.Buffers[0])
+		// fmt.Printf("Data : %x\n", msg.Buffers[0])
 		kcpsession.Send(msg.Buffers[0])
 	}
 	return err
