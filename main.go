@@ -222,7 +222,7 @@ func main() {
 		return
 	}
 
-	device := device.NewDevice(tdev, conn.NewDefaultBindKCP(), logger)
+	device := device.NewDevice(tdev, conn.NewExtBindKCP(), logger)
 
 	logger.Verbosef("Device started")
 

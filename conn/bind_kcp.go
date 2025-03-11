@@ -42,10 +42,6 @@ type KCPBind struct {
 	// these two fields are not guarded by mu
 	udpAddrPool sync.Pool
 	msgsPool    sync.Pool
-	// a system-wide packet buffer shared among sending, receiving and FEC
-	// to mitigate high-frequency memory allocation for packets, bytes from xmitBuf
-	// is aligned to 64bit
-	xmitBuf sync.Pool
 
 	blackhole4 bool
 	blackhole6 bool
@@ -60,7 +56,6 @@ func NewDefaultBindKCP() Bind {
 				}
 			},
 		},
-		connKCPs: make(map[string]*kcp.KCP),
 		msgsPool: sync.Pool{
 			New: func() any {
 				// ipv6.Message and ipv4.Message are interchangeable as they are
@@ -71,12 +66,6 @@ func NewDefaultBindKCP() Bind {
 					msgs[i].OOB = make([]byte, 0, stickyControlSize+gsoControlSize)
 				}
 				return &msgs
-			},
-		},
-
-		xmitBuf: sync.Pool{
-			New: func() interface{} {
-				return make([]byte, 1500)
 			},
 		},
 	}
@@ -106,6 +95,8 @@ func (s *KCPBind) Open(uport uint16) ([]ReceiveFunc, uint16, error) {
 	if s.ipv4 != nil || s.ipv6 != nil {
 		return nil, 0, ErrBindAlreadyOpen
 	}
+
+	s.connKCPs = make(map[string]*kcp.KCP)
 
 	// Attempt to open ipv4 and ipv6 listeners on the same port.
 	// If uport is 0, we can retry on failure.
@@ -243,7 +234,7 @@ func (s *KCPBind) receiveIP(
 		}
 		s.mu.Unlock()
 		kcpsession.Input(msg.Buffers[0][:msg.N], true, false)
-		msg.N = kcpsession.Recv(msg.Buffers[0])
+		//msg.N = kcpsession.Recv(msg.Buffers[0])
 		// if msg.N > 0 {
 		// 	fmt.Printf("Data : %x\n", msg.Buffers[0][:msg.N])
 		// 	fmt.Printf("Length : %d\n", msg.N)
