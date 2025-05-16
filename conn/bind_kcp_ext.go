@@ -14,7 +14,7 @@ import (
 	"sync"
 	"syscall"
 
-	"github.com/xtaci/kcp-go/v5"
+	"github.com/wirekcp/kcp-go/v5"
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
 )
@@ -37,16 +37,16 @@ type Msg struct {
 // proposal in https://github.com/golang/go/issues/45886#issuecomment-1218301564.
 type KCPExtBind struct {
 	mu   sync.Mutex // protects all fields except as specified
-	RWmu sync.RWMutex
 	ipv4 *net.UDPConn
 	ipv6 *net.UDPConn
 
 	pcv4 *ipv4.PacketConn
 	pcv6 *ipv6.PacketConn
 
-	connKCPs map[string]*kcp.UDPSession
+	v4listen *kcp.Listener
+	v6listen *kcp.Listener
 
-	chRec chan Msg
+	msgChan chan *Msg
 
 	ipv4TxOffload bool
 	ipv4RxOffload bool
@@ -73,7 +73,7 @@ func NewExtBindKCP() Bind {
 				}
 			},
 		},
-		chRec: make(chan Msg),
+		msgChan: make(chan *Msg),
 		msgsPool: sync.Pool{
 			New: func() any {
 				// ipv6.Message and ipv4.Message are interchangeable as they are
@@ -103,6 +103,66 @@ func (bind *KCPExtBind) SetMark(mark uint32) error {
 	return nil
 }
 
+func (bind *KCPExtBind) v4loop() {
+	for {
+		if conn, err := bind.v4listen.AcceptKCP(); err == nil {
+			conn.SetWriteDelay(false)
+			conn.SetNoDelay(0, 50, 0, 0)
+			conn.SetMtu(1350)
+			conn.SetWindowSize(1024, 1024)
+			conn.SetACKNoDelay(true)
+			go bind.handleConn(conn)
+		} else {
+			bind.msgChan <- &Msg{
+				closed: true,
+				addr:   nil,
+			}
+			break
+		}
+	}
+}
+
+func (bind *KCPExtBind) v6loop() {
+	for {
+		if conn, err := bind.v6listen.AcceptKCP(); err == nil {
+			conn.SetWriteDelay(false)
+			conn.SetNoDelay(0, 50, 0, 0)
+			conn.SetMtu(1350)
+			conn.SetWindowSize(1024, 1024)
+			conn.SetACKNoDelay(true)
+			go bind.handleConn(conn)
+		} else {
+			bind.msgChan <- &Msg{
+				closed: true,
+				addr:   nil,
+			}
+			break
+		}
+	}
+}
+
+func (bind *KCPExtBind) handleConn(conn *kcp.UDPSession) {
+	if conn == nil {
+		return
+	}
+	defer conn.Close()
+	for {
+		buf := make([]byte, mtuLimit)
+		n, err := conn.Read(buf)
+		if err != nil {
+			return
+		}
+		if n > 0 {
+			msg := &Msg{
+				data:   buf[:n],
+				length: n,
+				addr:   conn.RemoteAddr().(*net.UDPAddr),
+			}
+			bind.msgChan <- msg
+		}
+	}
+}
+
 func (s *KCPExtBind) Open(uport uint16) ([]ReceiveFunc, uint16, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -113,8 +173,6 @@ func (s *KCPExtBind) Open(uport uint16) ([]ReceiveFunc, uint16, error) {
 	if s.ipv4 != nil || s.ipv6 != nil {
 		return nil, 0, ErrBindAlreadyOpen
 	}
-
-	s.connKCPs = make(map[string]*kcp.UDPSession)
 
 	// Attempt to open ipv4 and ipv6 listeners on the same port.
 	// If uport is 0, we can retry on failure.
@@ -140,6 +198,20 @@ again:
 		return nil, 0, err
 	}
 
+	s.v4listen, err = kcp.ServeConn(nil, 10, 3, v4conn)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	s.v6listen, err = kcp.ServeConn(nil, 10, 3, v6conn)
+	if err != nil {
+		s.v4listen.Close()
+		return nil, 0, err
+	}
+
+	go s.v4loop()
+	go s.v6loop()
+
 	var fns []ReceiveFunc
 	if v4conn != nil {
 		s.ipv4TxOffload, s.ipv4RxOffload = supportsUDPOffload(v4conn)
@@ -162,78 +234,6 @@ again:
 	if len(fns) == 0 {
 		return nil, 0, syscall.EAFNOSUPPORT
 	}
-
-	go func() {
-		listener, err := kcp.ServeConn(nil, 10, 3, v4conn)
-		if err != nil {
-			return
-		}
-		for {
-			conn, err := listener.AcceptKCP()
-			if err != nil {
-				s.chRec <- Msg{closed: true}
-				return
-			}
-			if s.ipv4 == nil {
-				s.chRec <- Msg{closed: true}
-				return
-			}
-			s.RWmu.Lock()
-			s.connKCPs[conn.RemoteAddr().String()] = conn
-			s.RWmu.Unlock()
-			go func(conn *kcp.UDPSession) {
-				for {
-					if s.ipv4 == nil {
-						return
-					}
-					msg := Msg{data: make([]byte, mtuLimit)}
-					msg.length, err = conn.Read(msg.data)
-					if err != nil {
-						println("Read error")
-						return
-					}
-					msg.addr = conn.RemoteAddr().(*net.UDPAddr)
-					s.chRec <- msg
-				}
-			}(conn)
-		}
-	}()
-
-	go func() {
-		listenerv6, err := kcp.ServeConn(nil, 10, 3, v6conn)
-		if err != nil {
-			return
-		}
-		for {
-			conn, err := listenerv6.AcceptKCP()
-			if err != nil {
-				s.chRec <- Msg{closed: true}
-				return
-			}
-			if s.ipv6 == nil {
-				s.chRec <- Msg{closed: true}
-				return
-			}
-			s.RWmu.Lock()
-			s.connKCPs[conn.RemoteAddr().String()] = conn
-			s.RWmu.Unlock()
-			go func(conn *kcp.UDPSession) {
-				for {
-					if s.ipv6 == nil {
-						return
-					}
-					msg := Msg{data: make([]byte, mtuLimit)}
-					msg.length, err = conn.Read(msg.data)
-					if err != nil {
-						println("Read error")
-						return
-					}
-					msg.addr = conn.RemoteAddr().(*net.UDPAddr)
-					s.chRec <- msg
-				}
-			}(conn)
-		}
-	}()
 
 	return fns, uint16(port), nil
 }
@@ -269,52 +269,33 @@ func (s *KCPExtBind) receiveIP(
 		(*msgs)[i].OOB = (*msgs)[i].OOB[:cap((*msgs)[i].OOB)]
 	}
 	defer s.putMessages(msgs)
-	//var numMsgs int
-	// if runtime.GOOS == "linux" || runtime.GOOS == "android" {
-	// 	if rxOffload {
-	// 		readAt := len(*msgs) - (IdealBatchSize / udpSegmentMaxDatagrams)
-	// 		numMsgs, err = br.ReadBatch((*msgs)[readAt:], 0)
-	// 		if err != nil {
-	// 			return 0, err
-	// 		}
-	// 		numMsgs, err = splitCoalescedMessages(*msgs, readAt, getGSOSize)
-	// 		if err != nil {
-	// 			return 0, err
-	// 		}
-	// 	} else {
-	// 		numMsgs, err = br.ReadBatch(*msgs, 0)
-	// 		if err != nil {
-	// 			return 0, err
-	// 		}
-	// 	}
-	// } else {
-	//msg := &(*msgs)[0]
-	//msg.N, msg.NN, _, msg.Addr, err = conn.ReadMsgUDP(msg.Buffers[0], msg.OOB)
-	//if err != nil {
-	//	return 0, err
-	//}
-	//numMsgs = 1
-	// }
-	for recvMsg := range s.chRec {
-		if recvMsg.closed {
-			return 0, net.ErrClosed
+	var numMsgs int = 0
+	recv := <-s.msgChan
+	msg := &(*msgs)[numMsgs]
+
+	if recv.closed {
+		for len(s.msgChan) > 0 {
+			<-s.msgChan
 		}
-		msg := &(*msgs)[0]
-		msg.N = recvMsg.length
-		msg.NN = 0
-		copy(msg.Buffers[0], recvMsg.data)
-		if msg.N > 0 {
-			fmt.Printf("Data : %x\n", msg.Buffers[0][:msg.N])
-			fmt.Printf("Length : %d\n", msg.N)
-		}
-		sizes[0] = msg.N
-		addrPort := recvMsg.addr
-		ep := &StdNetEndpoint{AddrPort: addrPort.AddrPort()} // TODO: remove allocation
-		getSrcFromControl(msg.OOB[:msg.NN], ep)
-		eps[0] = ep
-		return 1, nil
+		return 0, net.ErrClosed
 	}
-	return 0, nil
+
+	msg.Addr = recv.addr
+	msg.Buffers[0] = recv.data[:recv.length]
+	msg.N = recv.length
+	msg.NN = 0
+
+	fmt.Printf("Received Data: %x\n", msg.Buffers[0][:recv.length])
+	sizes[numMsgs] = recv.length
+	if sizes[numMsgs] == 0 {
+		return numMsgs, nil
+	}
+	addrPort := msg.Addr.(*net.UDPAddr).AddrPort()
+	ep := &StdNetEndpoint{AddrPort: addrPort} // TODO: remove allocation
+	getSrcFromControl(msg.OOB[:msg.NN], ep)
+	eps[numMsgs] = ep
+	numMsgs++
+	return numMsgs, nil
 }
 
 func (s *KCPExtBind) makeReceiveIPv4(pc *ipv4.PacketConn, conn *net.UDPConn, rxOffload bool) ReceiveFunc {
@@ -343,11 +324,13 @@ func (s *KCPExtBind) Close() error {
 	defer s.mu.Unlock()
 
 	var err1, err2 error
-	if s.connKCPs != nil {
-		for k := range s.connKCPs {
-			delete(s.connKCPs, k)
-		}
-		s.connKCPs = nil
+	if s.v4listen != nil {
+		err1 = s.v4listen.Close()
+		s.v4listen = nil
+	}
+	if s.v6listen != nil {
+		err2 = s.v6listen.Close()
+		s.v6listen = nil
 	}
 	if s.ipv4 != nil {
 		err1 = s.ipv4.Close()
@@ -442,31 +425,18 @@ retry:
 
 func (s *KCPExtBind) send(conn *net.UDPConn, msgs []ipv6.Message) error {
 	var (
-		err error
+		sess *kcp.UDPSession
+		err  error
 	)
 	for _, msg := range msgs {
-		s.RWmu.RLock()
-		kcpsession, exists := s.connKCPs[msg.Addr.String()]
-		s.RWmu.RUnlock()
-		println("Send and RUnlock")
-		if !exists {
-			udpaddr := msg.Addr.(*net.UDPAddr)
-			fmt.Printf("Send to %s\n", udpaddr.String())
-			sess, err := kcp.NewConn(udpaddr.String(), nil, 10, 3, conn)
-			if err != nil {
-				err = syscall.EAFNOSUPPORT
-			}
-			if s.connKCPs != nil {
-				s.RWmu.Lock()
-				s.connKCPs[msg.Addr.String()] = sess
-				s.RWmu.Unlock()
-				println("Send and Unlock")
-			}
-			sess.Write(msg.Buffers[0])
-		} else {
-			kcpsession.Write(msg.Buffers[0])
+		if sess, err = kcp.NewConn2(msg.Addr, nil, 10, 3, conn); err == nil {
+			sess.SetWriteDelay(false)
+			sess.SetNoDelay(0, 50, 0, 0)
+			sess.SetMtu(1350)
+			sess.SetWindowSize(1024, 1024)
+			sess.SetACKNoDelay(true)
+			_, err = sess.Write(msg.Buffers[0])
 		}
-		fmt.Printf("Data : %x\n", msg.Buffers[0])
 	}
 	return err
 }

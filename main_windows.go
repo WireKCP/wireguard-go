@@ -24,6 +24,15 @@ const (
 	ExitSetupFailed  = 1
 )
 
+func init() {
+	tun.WintunTunnelType = "WireKCP"
+	guid, err := windows.GUIDFromString("{42b30cad-f96c-4369-9094-47a0d68cd40f}")
+	if err != nil {
+		panic(fmt.Sprintf("failed to parse GUID: %v", err))
+	}
+	tun.WintunStaticRequestedGUID = &guid
+}
+
 func main() {
 	if len(os.Args) != 2 {
 		os.Exit(ExitSetupFailed)
@@ -49,7 +58,7 @@ func main() {
 		os.Exit(ExitSetupFailed)
 	}
 
-	device := device.NewDevice(tun, conn.NewDefaultBindKCP(), logger)
+	device := device.NewDevice(tun, conn.NewExtBindKCP(), logger)
 	err = device.Up()
 	if err != nil {
 		logger.Errorf("Failed to bring up device: %v", err)
