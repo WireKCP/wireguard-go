@@ -7,7 +7,6 @@ package conn
 
 import (
 	"errors"
-	"fmt"
 	"net"
 	"net/netip"
 	"runtime"
@@ -281,11 +280,10 @@ func (s *KCPExtBind) receiveIP(
 	}
 
 	msg.Addr = recv.addr
-	msg.Buffers[0] = recv.data[:recv.length]
+	copy(msg.Buffers[0], recv.data[:recv.length])
 	msg.N = recv.length
 	msg.NN = 0
 
-	fmt.Printf("Received Data: %x\n", msg.Buffers[0][:recv.length])
 	sizes[numMsgs] = recv.length
 	if sizes[numMsgs] == 0 {
 		return numMsgs, nil
