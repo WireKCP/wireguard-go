@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: MIT
  *
- * Copyright (C) 2017-2023 WireGuard LLC. All Rights Reserved.
+ * Copyright (C) 2017-2025 WireGuard LLC. All Rights Reserved.
  */
 
 package main
@@ -23,15 +23,6 @@ const (
 	ExitSetupSuccess = 0
 	ExitSetupFailed  = 1
 )
-
-func init() {
-	tun.WintunTunnelType = "WireKCP"
-	guid, err := windows.GUIDFromString("{42b30cad-f96c-4369-9094-47a0d68cd40f}")
-	if err != nil {
-		panic(fmt.Sprintf("failed to parse GUID: %v", err))
-	}
-	tun.WintunStaticRequestedGUID = &guid
-}
 
 func main() {
 	if len(os.Args) != 2 {
