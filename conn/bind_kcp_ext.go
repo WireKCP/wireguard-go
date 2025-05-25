@@ -7,6 +7,7 @@ package conn
 
 import (
 	"errors"
+	"fmt"
 	"net"
 	"net/netip"
 	"runtime"
@@ -55,12 +56,13 @@ type KCPExtBind struct {
 	// these two fields are not guarded by mu
 	udpAddrPool sync.Pool
 	msgsPool    sync.Pool
-	// a system-wide packet buffer shared among sending, receiving and FEC
-	// to mitigate high-frequency memory allocation for packets, bytes from xmitBuf
-	// is aligned to 64bit
 
 	blackhole4 bool
 	blackhole6 bool
+
+	// --- Add session map for optimization ---
+	sessionMu sync.Mutex
+	sessions  map[string]*kcp.UDPSession // key: addr string (ip:port)
 }
 
 func NewExtBindKCP() Bind {
@@ -85,6 +87,7 @@ func NewExtBindKCP() Bind {
 				return &msgs
 			},
 		},
+		sessions: make(map[string]*kcp.UDPSession),
 	}
 }
 
@@ -107,9 +110,17 @@ func (bind *KCPExtBind) v4loop() {
 		if conn, err := bind.v4listen.AcceptKCP(); err == nil {
 			conn.SetWriteDelay(false)
 			conn.SetNoDelay(0, 50, 0, 0)
-			conn.SetMtu(1350)
+			conn.SetMtu(mtuLimit)
 			conn.SetWindowSize(1024, 1024)
 			conn.SetACKNoDelay(true)
+			// --- Save session for recv ---
+			addrStr := conn.RemoteAddr().String()
+			bind.sessionMu.Lock()
+			if old, exists := bind.sessions[addrStr]; exists && old != nil {
+				old.Close()
+			}
+			bind.sessions[addrStr] = conn
+			bind.sessionMu.Unlock()
 			go bind.handleConn(conn)
 		} else {
 			bind.msgChan <- &Msg{
@@ -126,9 +137,17 @@ func (bind *KCPExtBind) v6loop() {
 		if conn, err := bind.v6listen.AcceptKCP(); err == nil {
 			conn.SetWriteDelay(false)
 			conn.SetNoDelay(0, 50, 0, 0)
-			conn.SetMtu(1350)
+			conn.SetMtu(mtuLimit)
 			conn.SetWindowSize(1024, 1024)
 			conn.SetACKNoDelay(true)
+			// --- Save session for recv ---
+			addrStr := conn.RemoteAddr().String()
+			bind.sessionMu.Lock()
+			if old, exists := bind.sessions[addrStr]; exists && old != nil {
+				old.Close()
+			}
+			bind.sessions[addrStr] = conn
+			bind.sessionMu.Unlock()
 			go bind.handleConn(conn)
 		} else {
 			bind.msgChan <- &Msg{
@@ -144,7 +163,16 @@ func (bind *KCPExtBind) handleConn(conn *kcp.UDPSession) {
 	if conn == nil {
 		return
 	}
-	defer conn.Close()
+	defer func() {
+		// --- Remove session from map on close ---
+		addrStr := conn.RemoteAddr().String()
+		bind.sessionMu.Lock()
+		if bind.sessions[addrStr] == conn {
+			delete(bind.sessions, addrStr)
+		}
+		bind.sessionMu.Unlock()
+		conn.Close()
+	}()
 	for {
 		buf := make([]byte, mtuLimit)
 		n, err := conn.Read(buf)
@@ -280,9 +308,10 @@ func (s *KCPExtBind) receiveIP(
 	}
 
 	msg.Addr = recv.addr
-	copy(msg.Buffers[0], recv.data[:recv.length])
+	copy(msg.Buffers[0], recv.data)
 	msg.N = recv.length
 	msg.NN = 0
+	fmt.Printf("Data received: %x\n", recv.data[:recv.length])
 
 	sizes[numMsgs] = recv.length
 	if sizes[numMsgs] == 0 {
@@ -427,12 +456,22 @@ func (s *KCPExtBind) send(conn *net.UDPConn, msgs []ipv6.Message) error {
 		err  error
 	)
 	for _, msg := range msgs {
-		if sess, err = kcp.NewConn2(msg.Addr, nil, 10, 3, conn); err == nil {
-			sess.SetWriteDelay(false)
-			sess.SetNoDelay(0, 50, 0, 0)
-			sess.SetMtu(1350)
-			sess.SetWindowSize(1024, 1024)
-			sess.SetACKNoDelay(true)
+		addrStr := msg.Addr.String()
+		s.sessionMu.Lock()
+		sess = s.sessions[addrStr]
+		if sess == nil {
+			sess, err = kcp.NewConn2(msg.Addr, nil, 10, 3, conn)
+			if err == nil {
+				sess.SetWriteDelay(false)
+				sess.SetNoDelay(0, 50, 0, 0)
+				sess.SetMtu(mtuLimit)
+				sess.SetWindowSize(1024, 1024)
+				sess.SetACKNoDelay(true)
+				s.sessions[addrStr] = sess
+			}
+		}
+		s.sessionMu.Unlock()
+		if sess != nil && err == nil {
 			_, err = sess.Write(msg.Buffers[0])
 		}
 	}
