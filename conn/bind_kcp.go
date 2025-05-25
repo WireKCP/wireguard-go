@@ -16,7 +16,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/xtaci/kcp-go/v5"
+	"github.com/wirekcp/kcp-go/v5"
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
 )
@@ -42,10 +42,6 @@ type KCPBind struct {
 	// these two fields are not guarded by mu
 	udpAddrPool sync.Pool
 	msgsPool    sync.Pool
-	// a system-wide packet buffer shared among sending, receiving and FEC
-	// to mitigate high-frequency memory allocation for packets, bytes from xmitBuf
-	// is aligned to 64bit
-	xmitBuf sync.Pool
 
 	blackhole4 bool
 	blackhole6 bool
@@ -60,7 +56,6 @@ func NewDefaultBindKCP() Bind {
 				}
 			},
 		},
-		connKCPs: make(map[string]*kcp.KCP),
 		msgsPool: sync.Pool{
 			New: func() any {
 				// ipv6.Message and ipv4.Message are interchangeable as they are
@@ -71,12 +66,6 @@ func NewDefaultBindKCP() Bind {
 					msgs[i].OOB = make([]byte, 0, stickyControlSize+gsoControlSize)
 				}
 				return &msgs
-			},
-		},
-
-		xmitBuf: sync.Pool{
-			New: func() interface{} {
-				return make([]byte, 1500)
 			},
 		},
 	}
@@ -106,6 +95,8 @@ func (s *KCPBind) Open(uport uint16) ([]ReceiveFunc, uint16, error) {
 	if s.ipv4 != nil || s.ipv6 != nil {
 		return nil, 0, ErrBindAlreadyOpen
 	}
+
+	s.connKCPs = make(map[string]*kcp.KCP)
 
 	// Attempt to open ipv4 and ipv6 listeners on the same port.
 	// If uport is 0, we can retry on failure.
@@ -155,20 +146,6 @@ again:
 		return nil, 0, syscall.EAFNOSUPPORT
 	}
 
-	go func() {
-		for {
-			if s.connKCPs == nil {
-				break
-			}
-			time.Sleep(5 * time.Millisecond)
-			s.mu.Lock()
-			for _, kcpsession := range s.connKCPs {
-				kcpsession.Update()
-			}
-			s.mu.Unlock()
-		}
-	}()
-
 	return fns, uint16(port), nil
 }
 
@@ -204,44 +181,55 @@ func (s *KCPBind) receiveIP(
 	}
 	defer s.putMessages(msgs)
 	var numMsgs int
-	// if runtime.GOOS == "linux" || runtime.GOOS == "android" {
-	// 	if rxOffload {
-	// 		readAt := len(*msgs) - (IdealBatchSize / udpSegmentMaxDatagrams)
-	// 		numMsgs, err = br.ReadBatch((*msgs)[readAt:], 0)
-	// 		if err != nil {
-	// 			return 0, err
-	// 		}
-	// 		numMsgs, err = splitCoalescedMessages(*msgs, readAt, getGSOSize)
-	// 		if err != nil {
-	// 			return 0, err
-	// 		}
-	// 	} else {
-	// 		numMsgs, err = br.ReadBatch(*msgs, 0)
-	// 		if err != nil {
-	// 			return 0, err
-	// 		}
-	// 	}
-	// } else {
-	msg := &(*msgs)[0]
-	msg.N, msg.NN, _, msg.Addr, err = conn.ReadMsgUDP(msg.Buffers[0], msg.OOB)
-	if err != nil {
-		return 0, err
+	if runtime.GOOS == "linux" || runtime.GOOS == "android" {
+		if rxOffload {
+			readAt := len(*msgs) - (IdealBatchSize / udpSegmentMaxDatagrams)
+			numMsgs, err = br.ReadBatch((*msgs)[readAt:], 0)
+			if err != nil {
+				return 0, err
+			}
+			numMsgs, err = splitCoalescedMessages(*msgs, readAt, getGSOSize)
+			if err != nil {
+				return 0, err
+			}
+		} else {
+			numMsgs, err = br.ReadBatch(*msgs, 0)
+			if err != nil {
+				return 0, err
+			}
+		}
+	} else {
+		msg := &(*msgs)[0]
+		msg.N, msg.NN, _, msg.Addr, err = conn.ReadMsgUDP(msg.Buffers[0], msg.OOB)
+		if err != nil {
+			return 0, err
+		}
+		numMsgs = 1
 	}
-	numMsgs = 1
-	// }
 	for i := 0; i < numMsgs; i++ {
 		msg := &(*msgs)[i]
 		s.mu.Lock()
 		kcpsession, exists := s.connKCPs[msg.Addr.String()]
+		s.mu.Unlock()
 		if !exists {
 			convid := GetConv(msg.Buffers[0])
 			udpaddr := msg.Addr.(*net.UDPAddr)
 			kcpsession = kcp.NewKCP(convid, func(buf []byte, size int) {
 				conn.WriteToUDP(buf[:size], udpaddr)
 			})
+			s.mu.Lock()
 			s.connKCPs[msg.Addr.String()] = kcpsession
+			s.mu.Unlock()
+			go func() {
+				for {
+					if s.connKCPs == nil {
+						break
+					}
+					time.Sleep(time.Millisecond * 10)
+					kcpsession.Update()
+				}
+			}()
 		}
-		s.mu.Unlock()
 		kcpsession.Input(msg.Buffers[0][:msg.N], true, false)
 		msg.N = kcpsession.Recv(msg.Buffers[0])
 		// if msg.N > 0 {
@@ -249,7 +237,7 @@ func (s *KCPBind) receiveIP(
 		// 	fmt.Printf("Length : %d\n", msg.N)
 		// }
 		sizes[i] = msg.N
-		if sizes[i] == 0 {
+		if sizes[i] <= 0 {
 			continue
 		}
 		addrPort := msg.Addr.(*net.UDPAddr).AddrPort()
@@ -393,21 +381,32 @@ func (s *KCPBind) send(conn *net.UDPConn, pc batchWriter, msgs []ipv6.Message) e
 	for _, msg := range msgs {
 		s.mu.Lock()
 		kcpsession, exists := s.connKCPs[msg.Addr.String()]
+		s.mu.Unlock()
 		if !exists {
 			binary.Read(rand.Reader, binary.LittleEndian, &convid)
 			udpaddr := msg.Addr.(*net.UDPAddr)
 			kcpsession = kcp.NewKCP(convid, func(buf []byte, size int) {
 				_, err = conn.WriteToUDP(buf[:size], udpaddr)
 			})
+			s.mu.Lock()
 			s.connKCPs[msg.Addr.String()] = kcpsession
+			s.mu.Unlock()
+			go func() {
+				for {
+					if s.connKCPs == nil {
+						break
+					}
+					time.Sleep(time.Millisecond * 10)
+					kcpsession.Update()
+				}
+			}()
 		}
-		s.mu.Unlock()
 		if err != nil {
 			break
 		}
-		kcpsession.Input(msg.Buffers[0], true, false)
 		// fmt.Printf("Data : %x\n", msg.Buffers[0])
 		kcpsession.Send(msg.Buffers[0])
+		kcpsession.Update()
 	}
 	return err
 }

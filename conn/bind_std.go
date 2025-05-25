@@ -254,12 +254,10 @@ func (s *StdNetBind) receiveIP(
 			if err != nil {
 				return 0, err
 			}
-			println("numMsgs", numMsgs)
 		}
 	} else {
 		msg := &(*msgs)[0]
 		msg.N, msg.NN, _, msg.Addr, err = conn.ReadMsgUDP(msg.Buffers[0], msg.OOB)
-		println("msg.N", msg.N, "msg.NN", msg.NN, "msg.Addr", msg.Addr)
 		if err != nil {
 			return 0, err
 		}
