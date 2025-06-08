@@ -78,7 +78,9 @@ func NewExtBindKCP() Bind {
 				}
 			},
 		},
+
 		msgChan: make(chan *Msg, msgChanSize), // Increased buffer
+
 		msgsPool: sync.Pool{
 			New: func() any {
 				// ipv6.Message and ipv4.Message are interchangeable as they are
@@ -91,6 +93,7 @@ func NewExtBindKCP() Bind {
 				return &msgs
 			},
 		},
+
 		dataBufferPool: sync.Pool{
 			New: func() any {
 				buf := make([]byte, dataLimit)
@@ -118,6 +121,7 @@ func (bind *KCPExtBind) v4loop() {
 	for {
 		if conn, err := bind.v4listen.AcceptKCP(); err == nil {
 			conn.SetWriteDelay(false)
+
 			conn.SetNoDelay(1, 10, 2, 1) // Lower interval for faster response
 			conn.SetMtu(mtuLimit)
 			conn.SetWindowSize(2048, 2048) // Larger window for concurrency
@@ -128,6 +132,7 @@ func (bind *KCPExtBind) v4loop() {
 				old.(*kcp.UDPSession).Close()
 			}
 			bind.sessions.Store(addrStr, conn)
+
 			go bind.handleConn(conn)
 		} else {
 			bind.msgChan <- &Msg{
@@ -153,6 +158,7 @@ func (bind *KCPExtBind) v6loop() {
 				old.(*kcp.UDPSession).Close()
 			}
 			bind.sessions.Store(addrStr, conn)
+
 			go bind.handleConn(conn)
 		} else {
 			bind.msgChan <- &Msg{
@@ -248,11 +254,13 @@ again:
 
 	var fns []ReceiveFunc
 	if v4conn != nil {
+
 		fns = append(fns, s.makeReceiveIPv4(v4conn))
 		s.ipv4 = v4conn
 	}
 	if v6conn != nil {
 		fns = append(fns, s.makeReceiveIPv6(v6conn))
+
 		s.ipv6 = v6conn
 	}
 	if len(fns) == 0 {
