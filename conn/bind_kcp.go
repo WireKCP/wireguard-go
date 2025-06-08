@@ -16,7 +16,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/wirekcp/kcp-go/v5"
+	"github.com/xtaci/kcp-go/v5"
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
 )
