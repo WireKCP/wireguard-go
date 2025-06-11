@@ -19,10 +19,10 @@ import (
 )
 
 const (
-	mtuLimit    = 1520
+	mtuLimit    = 1520 // Use 1520 to match kcp-go's default and avoid slice out of bounds
 	max_UDP     = 65507
 	dataLimit   = max_UDP - kcp.IKCP_OVERHEAD
-	msgChanSize = 2048 // Increased channel buffer for high concurrency
+	msgChanSize = 8192 // Increased further to reduce risk of drops under burst
 )
 
 type Msg struct {
@@ -38,35 +38,22 @@ type Msg struct {
 // methods for sending and receiving multiple datagrams per-syscall. See the
 // proposal in https://github.com/golang/go/issues/45886#issuecomment-1218301564.
 type KCPExtBind struct {
-	mu   sync.Mutex // protects all fields except as specified
-	ipv4 *net.UDPConn
-	ipv6 *net.UDPConn
-
-	pcv4 *ipv4.PacketConn
-	pcv6 *ipv6.PacketConn
-
-	v4listen *kcp.Listener
-	v6listen *kcp.Listener
-
-	msgChan chan *Msg
-
-	ipv4TxOffload bool
-	ipv4RxOffload bool
-	ipv6TxOffload bool
-	ipv6RxOffload bool
-
-	// these two fields are not guarded by mu
-	udpAddrPool sync.Pool
-	msgsPool    sync.Pool
-
-	blackhole4 bool
-	blackhole6 bool
-
-	// --- Add session map for optimization ---
-	sessions sync.Map // key: string, value: *kcp.UDPSession
-
-	// Buffer pool for incoming data
+	mu             sync.Mutex
+	ipv4           *net.UDPConn
+	ipv6           *net.UDPConn
+	v4listen       *kcp.Listener
+	v6listen       *kcp.Listener
+	msgChan        chan *Msg
+	blackhole4     bool
+	blackhole6     bool
+	ipv6RxOffload  bool
+	ipv6TxOffload  bool
+	ipv4RxOffload  bool
+	ipv4TxOffload  bool
+	udpAddrPool    sync.Pool
+	msgsPool       sync.Pool
 	dataBufferPool sync.Pool
+	sessions       sync.Map
 }
 
 func NewExtBindKCP() Bind {
@@ -78,13 +65,9 @@ func NewExtBindKCP() Bind {
 				}
 			},
 		},
-
-		msgChan: make(chan *Msg, msgChanSize), // Increased buffer
-
+		msgChan: make(chan *Msg, msgChanSize),
 		msgsPool: sync.Pool{
 			New: func() any {
-				// ipv6.Message and ipv4.Message are interchangeable as they are
-				// both aliases for x/net/internal/socket.Message.
 				msgs := make([]ipv6.Message, IdealBatchSize)
 				for i := range msgs {
 					msgs[i].Buffers = make(net.Buffers, 1)
@@ -93,7 +76,6 @@ func NewExtBindKCP() Bind {
 				return &msgs
 			},
 		},
-
 		dataBufferPool: sync.Pool{
 			New: func() any {
 				buf := make([]byte, dataLimit)
@@ -121,10 +103,9 @@ func (bind *KCPExtBind) v4loop() {
 	for {
 		if conn, err := bind.v4listen.AcceptKCP(); err == nil {
 			conn.SetWriteDelay(false)
-
-			conn.SetNoDelay(1, 10, 2, 1) // Lower interval for faster response
+			conn.SetNoDelay(1, 10, 2, 1) // interval=10ms
 			conn.SetMtu(mtuLimit)
-			conn.SetWindowSize(2048, 2048) // Larger window for concurrency
+			conn.SetWindowSize(65535, 65535)
 			conn.SetACKNoDelay(true)
 			// --- Save session for recv ---
 			addrStr := conn.RemoteAddr().String()
@@ -150,7 +131,7 @@ func (bind *KCPExtBind) v6loop() {
 			conn.SetWriteDelay(false)
 			conn.SetNoDelay(1, 10, 2, 1)
 			conn.SetMtu(mtuLimit)
-			conn.SetWindowSize(2048, 2048)
+			conn.SetWindowSize(65535, 65535)
 			conn.SetACKNoDelay(true)
 			// --- Save session for recv ---
 			addrStr := conn.RemoteAddr().String()
@@ -194,11 +175,9 @@ func (bind *KCPExtBind) handleConn(conn *kcp.UDPSession) {
 				length: n,
 				addr:   conn.RemoteAddr().(*net.UDPAddr),
 			}
-			// Non-blocking send to avoid blocking goroutine
 			select {
 			case bind.msgChan <- msg:
 			default:
-				// Drop if channel is full (could log/count here)
 			}
 		}
 		bind.dataBufferPool.Put(bufPtr)
@@ -215,9 +194,6 @@ func (s *KCPExtBind) Open(uport uint16) ([]ReceiveFunc, uint16, error) {
 	if s.ipv4 != nil || s.ipv6 != nil {
 		return nil, 0, ErrBindAlreadyOpen
 	}
-
-	// Attempt to open ipv4 and ipv6 listeners on the same port.
-	// If uport is 0, we can retry on failure.
 again:
 	port := int(uport)
 	var v4conn, v6conn *net.UDPConn
@@ -254,7 +230,6 @@ again:
 
 	var fns []ReceiveFunc
 	if v4conn != nil {
-
 		fns = append(fns, s.makeReceiveIPv4(v4conn))
 		s.ipv4 = v4conn
 	}
@@ -364,12 +339,10 @@ func (s *KCPExtBind) Close() error {
 	if s.ipv4 != nil {
 		err1 = s.ipv4.Close()
 		s.ipv4 = nil
-		s.pcv4 = nil
 	}
 	if s.ipv6 != nil {
 		err2 = s.ipv6.Close()
 		s.ipv6 = nil
-		s.pcv6 = nil
 	}
 	s.blackhole4 = false
 	s.blackhole6 = false
@@ -467,7 +440,7 @@ func (s *KCPExtBind) send(conn *net.UDPConn, msgs []ipv6.Message) error {
 				sess.SetWriteDelay(false)
 				sess.SetNoDelay(1, 10, 2, 1)
 				sess.SetMtu(mtuLimit)
-				sess.SetWindowSize(2048, 2048)
+				sess.SetWindowSize(4096, 4096)
 				sess.SetACKNoDelay(true)
 				s.sessions.Store(addrStr, sess)
 			}

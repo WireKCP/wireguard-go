@@ -129,6 +129,11 @@ func (device *Device) RoutineReceiveIncoming(maxBatchSize int, recv conn.Receive
 		// handle each packet in the batch
 		for i, size := range sizes[:count] {
 			if size < MinMessageSize {
+				// Debug: log and recycle buffer
+				device.log.Verbosef("Dropped packet: too small (%d bytes)", size)
+				device.PutMessageBuffer(bufsArrs[i])
+				bufsArrs[i] = device.GetMessageBuffer()
+				bufs[i] = bufsArrs[i][:]
 				continue
 			}
 
@@ -205,6 +210,10 @@ func (device *Device) RoutineReceiveIncoming(maxBatchSize int, recv conn.Receive
 
 			default:
 				device.log.Verbosef("Received message with unknown type")
+				// Recycle buffer for unknown type
+				device.PutMessageBuffer(bufsArrs[i])
+				bufsArrs[i] = device.GetMessageBuffer()
+				bufs[i] = bufsArrs[i][:]
 				continue
 			}
 
