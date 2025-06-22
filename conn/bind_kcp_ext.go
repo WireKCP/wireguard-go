@@ -329,14 +329,6 @@ func (s *KCPExtBind) Close() error {
 
 	var err1, err2 error
 
-	s.sessions.Range(func(key, value any) bool {
-		if sess, ok := value.(*kcp.UDPSession); ok {
-			sess.Close()
-		}
-		return true
-	})
-	s.sessions.Clear()
-
 	if s.v4listen != nil {
 		err1 = s.v4listen.Close()
 		s.v4listen = nil
@@ -359,6 +351,15 @@ func (s *KCPExtBind) Close() error {
 	s.ipv4RxOffload = false
 	s.ipv6TxOffload = false
 	s.ipv6RxOffload = false
+
+	s.sessions.Range(func(key, value any) bool {
+		if sess, ok := value.(*kcp.UDPSession); ok {
+			sess.Close()
+		}
+		return true
+	})
+
+	s.sessions.Clear()
 
 	if err1 != nil {
 		return err1

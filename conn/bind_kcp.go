@@ -217,6 +217,7 @@ func (s *KCPBind) receiveIP(
 			kcpsession = kcp.NewKCP(convid, func(buf []byte, size int) {
 				conn.WriteToUDP(buf[:size], udpaddr)
 			})
+			kcpsession.NoDelay(1, 10, 2, 1) // Set KCP parameters
 			s.mu.Lock()
 			s.connKCPs[msg.Addr.String()] = kcpsession
 			s.mu.Unlock()
