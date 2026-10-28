@@ -25,13 +25,10 @@ const (
 	kcpUpdateInterval   = 10 * time.Millisecond
 	kcpPeerSwitchWindow = 5 * time.Second
 	kcpSocketBufferSize = 4 * 1024 * 1024
-	kcpReliableMarker   = 0
-	kcpDataMarker       = 1
 )
 
 type KCPOptions struct {
-	Profile        string
-	UnreliableData bool
+	Profile string
 }
 
 type kcpTuning struct {
@@ -120,19 +117,12 @@ func newKCPSession(conn *net.UDPConn, remote *net.UDPAddr, conv uint32, options 
 		remote:       &remoteCopy,
 		lastActivity: time.Now(),
 	}
-	wireBuffer := make([]byte, kcpSessionMTU+1)
 	session.kcp = kcp.NewKCP(conv, func(packet []byte, size int) {
 		if size < 0 || size > len(packet) {
 			session.writeErr = errors.New("KCP produced an invalid datagram size")
 			return
 		}
-		wirePacket := packet[:size]
-		if options.UnreliableData {
-			wireBuffer[0] = kcpReliableMarker
-			copy(wireBuffer[1:], wirePacket)
-			wirePacket = wireBuffer[:size+1]
-		}
-		_, err := conn.WriteToUDP(wirePacket, session.remote)
+		_, err := conn.WriteToUDP(packet[:size], session.remote)
 		if err != nil {
 			session.writeErr = err
 		}
@@ -415,28 +405,6 @@ func (state *kcpBindState) receive(conn *net.UDPConn, readBuffer []byte, bufs []
 			}
 		}
 		packet := readBuffer[:length]
-		if state.options.UnreliableData {
-			if len(packet) == 0 {
-				continue
-			}
-			switch packet[0] {
-			case kcpDataMarker:
-				packet = packet[1:]
-				if !isWireGuardData(packet) {
-					continue
-				}
-				if len(packet) > len(bufs[0]) {
-					return 0, io.ErrShortBuffer
-				}
-				sizes[0] = copy(bufs[0], packet)
-				endpoints[0] = &StdNetEndpoint{AddrPort: remote.AddrPort()}
-				return 1, nil
-			case kcpReliableMarker:
-				packet = packet[1:]
-			default:
-				continue
-			}
-		}
 		peer, session, created := state.inboundSession(conn, remote, packet)
 		if session == nil {
 			continue
@@ -585,37 +553,6 @@ func (bind *KCPExtBind) Send(packets [][]byte, endpoint Endpoint) error {
 		return errors.New("unsupported KCP endpoint type")
 	}
 	remote := net.UDPAddrFromAddrPort(stdEndpoint.AddrPort)
-	if state.options.UnreliableData {
-		var reliable [][]byte
-		var wireBuffer []byte
-		for _, packet := range packets {
-			if !isWireGuardData(packet) {
-				reliable = append(reliable, packet)
-				continue
-			}
-			if len(packet) > 65506 {
-				return errors.New("WireGuard data exceeds hybrid UDP datagram limit")
-			}
-			if cap(wireBuffer) < len(packet)+1 {
-				wireBuffer = make([]byte, len(packet)+1)
-			}
-			wirePacket := wireBuffer[:len(packet)+1]
-			wirePacket[0] = kcpDataMarker
-			copy(wirePacket[1:], packet)
-			if _, err := conn.WriteToUDP(wirePacket, remote); err != nil {
-				return err
-			}
-		}
-		packets = reliable
-		if len(packets) == 0 {
-			select {
-			case <-state.done:
-				return net.ErrClosed
-			default:
-				return nil
-			}
-		}
-	}
 	for {
 		_, session, err := state.outboundSession(conn, remote)
 		if err != nil {
@@ -660,8 +597,4 @@ func (bind *KCPExtBind) Send(packets [][]byte, endpoint Endpoint) error {
 		session.mu.Unlock()
 		return err
 	}
-}
-
-func isWireGuardData(packet []byte) bool {
-	return len(packet) >= 32 && binary.LittleEndian.Uint32(packet[:4]) == 4
 }

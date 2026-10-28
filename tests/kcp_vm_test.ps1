@@ -2,7 +2,7 @@ param(
     [Parameter(Mandatory = $true)][string]$Binary,
     [Parameter(Mandatory = $true)][string]$TestBinary,
     [string]$OutputDirectory = (Join-Path $env:TEMP 'wirekcp-phase2-results'),
-    [ValidateSet('udp', 'lan', 'wan', 'hybrid')][string[]]$Modes = @('udp', 'lan', 'wan', 'hybrid'),
+    [ValidateSet('udp', 'lan', 'wan')][string[]]$Modes = @('udp', 'lan', 'wan'),
     [ValidateRange(3, 60)][int]$Seconds = 5,
     [switch]$SkipTests,
     [switch]$SkipImpairment
@@ -44,7 +44,7 @@ done
 '@ | Out-Null
 }
 
-function Start-Mode([string]$Name, [string]$Profile, [bool]$Hybrid) {
+function Start-Mode([string]$Name, [string]$Profile) {
     foreach ($vm in 1, 2) { Stop-Engine $vm }
     Invoke-Vm 2 "nohup timeout 20 tcpdump -U -ni eth1 -c 32 -w $root/$Name.pcap 'udp port 51820' >$root/$Name-capture.log 2>&1 </dev/null &" | Out-Null
     foreach ($vm in 1, 2) {
@@ -52,7 +52,6 @@ function Start-Mode([string]$Name, [string]$Profile, [bool]$Hybrid) {
         $peer = if ($vm -eq 1) { 2 } else { 1 }
         $outer = if ($vm -eq 1) { '192.168.94.11' } else { '192.168.94.10' }
         $mode = if ($Name -eq 'udp') { 'udp' } else { 'kcp' }
-        $hybridValue = $Hybrid.ToString().ToLowerInvariant()
         $public = $publicKeys[$peer]
         $command = @"
 set -eu
@@ -63,7 +62,6 @@ ListenPort = 51820
 PrivateKey = "`$(cat /root/wirekcp-phase1-test/private.key)"
 Mode = "$mode"
 KCPProfile = "$Profile"
-KCPUnreliableData = $hybridValue
 [[Peers]]
 PublicKey = "$public"
 Endpoint = "${outer}:51820"
@@ -82,7 +80,7 @@ echo `$! >$root/engine.pid
         $handshake = Invoke-Vm $vm 'timeout 5 wg show wirekcp0 latest-handshakes'
         if ($handshake -notmatch '\s[1-9][0-9]*$') { throw "$Name VM $vm has no WireGuard handshake" }
     }
-    Write-Output "Started $Name profile=$Profile hybrid=$Hybrid"
+    Write-Output "Started $Name profile=$Profile (reliable KCP)"
 }
 
 function Measure-Iperf([string]$Mode, [string]$Label, [string]$Arguments) {
@@ -173,21 +171,21 @@ $expectedHash = (Invoke-Vm 1 "sha256sum $root/payload.bin").Split(' ')[0]
 try {
     foreach ($mode in $Modes) {
         $profile = if ($mode -eq 'wan') { 'wan' } else { 'lan' }
-        Start-Mode $mode $profile ($mode -eq 'hybrid')
+        Start-Mode $mode $profile
         for ($repeat = 1; $repeat -le 3; $repeat++) { Measure-Iperf $mode "tcp-$repeat" '' }
         Measure-Iperf $mode 'tcp-reverse' '-R'
         Measure-Iperf $mode 'udp-5m' '-u -b 5M -l 1200'
         Measure-Iperf $mode 'udp-25m' '-u -b 25M -l 1200'
-        if ($mode -in @('udp', 'hybrid')) {
+        if ($mode -eq 'udp') {
             Measure-Iperf $mode 'udp-100m' '-u -b 100M -l 1200'
         }
         Test-Integrity $mode
     }
-    foreach ($mode in $(if ($SkipImpairment) { @() } else { @('wan', 'hybrid') })) {
+    foreach ($mode in $(if ($SkipImpairment) { @() } else { @('wan') })) {
         $impairmentLabel = "$mode-loss"
         Set-Impairment
         try {
-            Start-Mode "$mode-loss" 'wan' ($mode -eq 'hybrid')
+            Start-Mode "$mode-loss" 'wan'
             Measure-Iperf "$mode-loss" 'tcp' ''
             Test-Integrity "$mode-loss" 1048576
             $ping = Invoke-Vm 1 'ping -c 100 -i 0.05 -W 2 192.168.201.2'
@@ -196,7 +194,7 @@ try {
     }
 } finally {
     Clear-Impairment
-    Start-Mode 'final-kcp' 'wan' $false
+    Start-Mode 'final-kcp' 'wan'
     foreach ($vm in 1, 2) {
         Invoke-Vm $vm "if [ -f $root/iperf-server.pid ]; then kill `$(cat $root/iperf-server.pid) 2>/dev/null || true; fi" | Out-Null
     }

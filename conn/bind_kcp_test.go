@@ -123,7 +123,7 @@ func (client *kcpTestClient) receive(buffer []byte) (int, error) {
 	}
 }
 
-func TestKCPExtBindConversationRoutingAndPacketBoundaries(t *testing.T) {
+func TestKCPExtBindReliableConversationAndPacketBoundaries(t *testing.T) {
 	bind := NewExtBindKCP().(*KCPExtBind)
 	functions, port, err := bind.Open(0)
 	if err != nil {
@@ -132,7 +132,11 @@ func TestKCPExtBindConversationRoutingAndPacketBoundaries(t *testing.T) {
 	t.Cleanup(func() { bind.Close() })
 	address := net.JoinHostPort("127.0.0.1", strconv.Itoa(int(port)))
 	clients := []*kcpTestClient{newKCPTestClient(t, address, 11), newKCPTestClient(t, address, 22)}
-	expected := [][]byte{bytes.Repeat([]byte{0x42}, 1452), bytes.Repeat([]byte{0x24}, 768)}
+	handshake := make([]byte, 148)
+	binary.LittleEndian.PutUint32(handshake, 1)
+	transport := bytes.Repeat([]byte{0x42}, 1452)
+	binary.LittleEndian.PutUint32(transport, 4)
+	expected := [][]byte{handshake, transport}
 	for index, client := range clients {
 		if err := client.send(expected[index]); err != nil {
 			t.Fatal(err)
@@ -275,20 +279,22 @@ func TestKCPProfiles(t *testing.T) {
 }
 
 func TestKCPBackpressureCanceledByClose(t *testing.T) {
-	bind := NewExtBindKCP().(*KCPExtBind)
-	if _, _, err := bind.Open(0); err != nil {
-		t.Fatal(err)
-	}
-	defer bind.Close()
-	remote := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 9}
-	peer, session, err := bind.state.outboundSession(bind.ipv4, remote)
+	socket, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if err != nil {
 		t.Fatal(err)
 	}
-	bind.state.mu.Lock()
+	state := &kcpBindState{done: make(chan struct{}), peers: make(map[string]*kcpPeer)}
+	bind := &KCPExtBind{ipv4: socket, state: state}
+	defer bind.Close()
+	remote := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 9}
+	peer, session, err := state.outboundSession(socket, remote)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state.mu.Lock()
 	peer.lastInbound = time.Now().Add(time.Hour)
-	bind.state.mu.Unlock()
-	tuning, _ := bind.state.options.tuning()
+	state.mu.Unlock()
+	tuning, _ := state.options.tuning()
 	session.mu.Lock()
 	for packet := 0; packet < 2*tuning.window; packet++ {
 		session.kcp.Send([]byte{1})
@@ -312,78 +318,6 @@ func TestKCPBackpressureCanceledByClose(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("Close did not release saturated sender")
-	}
-}
-
-func TestKCPHybridWireAndReceive(t *testing.T) {
-	remote, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer remote.Close()
-	bind, err := NewExtBindKCPWithOptions(KCPOptions{Profile: "lan", UnreliableData: true})
-	if err != nil {
-		t.Fatal(err)
-	}
-	functions, port, err := bind.Open(0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer bind.Close()
-	if _, rxOffload := supportsUDPOffload(bind.ipv4); rxOffload {
-		t.Fatal("KCP socket enables GRO without a coalesced-datagram reader")
-	}
-	endpoint, err := bind.ParseEndpoint(remote.LocalAddr().String())
-	if err != nil {
-		t.Fatal(err)
-	}
-	data := make([]byte, 1452)
-	binary.LittleEndian.PutUint32(data, 4)
-	control := make([]byte, 148)
-	binary.LittleEndian.PutUint32(control, 1)
-	if err := bind.Send([][]byte{control, data}, endpoint); err != nil {
-		t.Fatal(err)
-	}
-	remote.SetReadDeadline(time.Now().Add(3 * time.Second))
-	buffer := make([]byte, 2048)
-	seenData, seenControl := false, false
-	for !seenData || !seenControl {
-		length, _, err := remote.ReadFromUDP(buffer)
-		if err != nil {
-			t.Fatal(err)
-		}
-		switch buffer[0] {
-		case kcpDataMarker:
-			if !bytes.Equal(buffer[1:length], data) {
-				t.Fatal("hybrid data changed")
-			}
-			seenData = true
-		case kcpReliableMarker:
-			if length < 25 || buffer[5] != 81 || binary.LittleEndian.Uint32(buffer[25:29]) != 1 {
-				t.Fatal("handshake not carried by KCP")
-			}
-			seenControl = true
-		default:
-			t.Fatal("unrecognized hybrid marker")
-		}
-	}
-	destination := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: int(port)}
-	for _, malformed := range [][]byte{{}, {2, 4}, append([]byte{kcpDataMarker}, control...), {kcpDataMarker, 4}} {
-		if _, err := remote.WriteToUDP(malformed, destination); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if _, err := remote.WriteToUDP(append([]byte{kcpDataMarker}, data...), destination); err != nil {
-		t.Fatal(err)
-	}
-	bind.ipv4.SetReadDeadline(time.Now().Add(3 * time.Second))
-	sizes, endpoints := make([]int, 1), make([]Endpoint, 1)
-	count, err := functions[0]([][]byte{buffer}, sizes, endpoints)
-	if err != nil || count != 1 || !bytes.Equal(buffer[:sizes[0]], data) {
-		t.Fatalf("hybrid receive count=%d, error=%v", count, err)
-	}
-	if endpoints[0].DstToString() != remote.LocalAddr().String() {
-		t.Fatal("hybrid endpoint changed")
 	}
 }
 
