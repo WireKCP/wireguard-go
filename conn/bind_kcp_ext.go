@@ -6,459 +6,662 @@
 package conn
 
 import (
+	"crypto/rand"
+	"encoding/binary"
 	"errors"
+	"io"
 	"net"
 	"net/netip"
-	"runtime"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/xtaci/kcp-go/v5"
-	"golang.org/x/net/ipv4"
-	"golang.org/x/net/ipv6"
 )
 
 const (
-	mtuLimit    = 1520 // Use 1520 to match kcp-go's default and avoid slice out of bounds
-	max_UDP     = 65507
-	dataLimit   = max_UDP - kcp.IKCP_OVERHEAD
-	msgChanSize = 8192 // Increased further to reduce risk of drops under burst
+	kcpSessionMTU       = 1400
+	kcpMaxPacket        = 65535
+	kcpUpdateInterval   = 10 * time.Millisecond
+	kcpPeerSwitchWindow = 5 * time.Second
+	kcpSocketBufferSize = 4 * 1024 * 1024
+	kcpReliableMarker   = 0
+	kcpDataMarker       = 1
 )
 
-type Msg struct {
-	data   []byte
-	length int
-	addr   *net.UDPAddr
-	closed bool
+type KCPOptions struct {
+	Profile        string
+	UnreliableData bool
 }
 
-// StdNetBind implements Bind for all platforms. While Windows has its own Bind
-// (see bind_windows.go), it may fall back to StdNetBind.
-// TODO: Remove usage of ipv{4,6}.PacketConn when net.UDPConn has comparable
-// methods for sending and receiving multiple datagrams per-syscall. See the
-// proposal in https://github.com/golang/go/issues/45886#issuecomment-1218301564.
-type KCPExtBind struct {
-	mu             sync.Mutex
-	ipv4           *net.UDPConn
-	ipv6           *net.UDPConn
-	v4listen       *kcp.Listener
-	v6listen       *kcp.Listener
-	msgChan        chan *Msg
-	blackhole4     bool
-	blackhole6     bool
-	ipv6RxOffload  bool
-	ipv6TxOffload  bool
-	ipv4RxOffload  bool
-	ipv4TxOffload  bool
-	udpAddrPool    sync.Pool
-	msgsPool       sync.Pool
-	dataBufferPool sync.Pool
-	sessions       sync.Map
+type kcpTuning struct {
+	window     int
+	congestion int
 }
 
-func NewExtBindKCP() Bind {
-	return &KCPExtBind{
-		udpAddrPool: sync.Pool{
-			New: func() any {
-				return &net.UDPAddr{
-					IP: make([]byte, 16),
-				}
-			},
-		},
-		msgChan: make(chan *Msg, msgChanSize),
-		msgsPool: sync.Pool{
-			New: func() any {
-				msgs := make([]ipv6.Message, IdealBatchSize)
-				for i := range msgs {
-					msgs[i].Buffers = make(net.Buffers, 1)
-					msgs[i].OOB = make([]byte, 0, stickyControlSize+gsoControlSize)
-				}
-				return &msgs
-			},
-		},
-		dataBufferPool: sync.Pool{
-			New: func() any {
-				buf := make([]byte, dataLimit)
-				return &buf
-			},
-		},
+func (options KCPOptions) tuning() (kcpTuning, error) {
+	switch options.Profile {
+	case "", "lan":
+		return kcpTuning{window: 1024, congestion: 1}, nil
+	case "wan":
+		return kcpTuning{window: 512, congestion: 0}, nil
+	default:
+		return kcpTuning{}, errors.New("KCP profile must be lan or wan")
 	}
 }
 
-func (*KCPExtBind) ParseEndpoint(s string) (Endpoint, error) {
-	e, err := netip.ParseAddrPort(s)
+type kcpSession struct {
+	conn         *net.UDPConn
+	remote       *net.UDPAddr
+	kcp          *kcp.KCP
+	mu           sync.Mutex
+	lastActivity time.Time
+	writeErr     error
+	retired      bool
+}
+
+type kcpPeer struct {
+	address          string
+	remote           *net.UDPAddr
+	sessions         map[uint32]*kcpSession
+	tx               *kcpSession
+	preferred        *kcpSession
+	lastInbound      time.Time
+	lastConversation time.Time
+}
+
+type kcpBindState struct {
+	mu      sync.Mutex
+	closed  bool
+	done    chan struct{}
+	peers   map[string]*kcpPeer
+	updater sync.WaitGroup
+	options KCPOptions
+}
+
+type KCPExtBind struct {
+	mu         sync.Mutex
+	ipv4       *net.UDPConn
+	ipv6       *net.UDPConn
+	state      *kcpBindState
+	blackhole4 bool
+	blackhole6 bool
+	options    KCPOptions
+}
+
+func NewExtBindKCP() Bind { return &KCPExtBind{} }
+
+func NewExtBindKCPWithOptions(options KCPOptions) (*KCPExtBind, error) {
+	if _, err := options.tuning(); err != nil {
+		return nil, err
+	}
+	return &KCPExtBind{options: options}, nil
+}
+
+func (*KCPExtBind) ParseEndpoint(address string) (Endpoint, error) {
+	endpoint, err := netip.ParseAddrPort(address)
 	if err != nil {
 		return nil, err
 	}
-	return &StdNetEndpoint{
-		AddrPort: e,
-	}, nil
+	return &StdNetEndpoint{AddrPort: endpoint}, nil
 }
 
-func (bind *KCPExtBind) SetMark(mark uint32) error {
-	return nil
-}
+func (*KCPExtBind) SetMark(mark uint32) error { return nil }
 
-func (bind *KCPExtBind) v4loop() {
-	for {
-		if conn, err := bind.v4listen.AcceptKCP(); err == nil {
-			conn.SetWriteDelay(false)
-			conn.SetNoDelay(1, 10, 2, 1) // interval=10ms
-			conn.SetMtu(mtuLimit)
-			conn.SetWindowSize(65535, 65535)
-			conn.SetACKNoDelay(true)
-			// --- Save session for recv ---
-			addrStr := conn.RemoteAddr().String()
-			if old, exists := bind.sessions.Load(addrStr); exists && old != nil {
-				old.(*kcp.UDPSession).Close()
-			}
-			bind.sessions.Store(addrStr, conn)
-
-			go bind.handleConn(conn)
-		} else {
-			bind.msgChan <- &Msg{
-				closed: true,
-				addr:   nil,
-			}
-			break
-		}
+func newKCPSession(conn *net.UDPConn, remote *net.UDPAddr, conv uint32, options KCPOptions) (*kcpSession, error) {
+	tuning, err := options.tuning()
+	if err != nil {
+		return nil, err
 	}
-}
-
-func (bind *KCPExtBind) v6loop() {
-	for {
-		if conn, err := bind.v6listen.AcceptKCP(); err == nil {
-			conn.SetWriteDelay(false)
-			conn.SetNoDelay(1, 10, 2, 1)
-			conn.SetMtu(mtuLimit)
-			conn.SetWindowSize(65535, 65535)
-			conn.SetACKNoDelay(true)
-			// --- Save session for recv ---
-			addrStr := conn.RemoteAddr().String()
-			if old, exists := bind.sessions.Load(addrStr); exists && old != nil {
-				old.(*kcp.UDPSession).Close()
-			}
-			bind.sessions.Store(addrStr, conn)
-
-			go bind.handleConn(conn)
-		} else {
-			bind.msgChan <- &Msg{
-				closed: true,
-				addr:   nil,
-			}
-			break
-		}
+	remoteCopy := *remote
+	remoteCopy.IP = append(net.IP(nil), remote.IP...)
+	session := &kcpSession{
+		conn:         conn,
+		remote:       &remoteCopy,
+		lastActivity: time.Now(),
 	}
-}
-
-func (bind *KCPExtBind) handleConn(conn *kcp.UDPSession) {
-	if conn == nil {
-		return
-	}
-	defer func() {
-		addrStr := conn.RemoteAddr().String()
-		bind.sessions.Delete(addrStr)
-		conn.Close()
-	}()
-	for {
-		bufPtr := bind.dataBufferPool.Get().(*[]byte)
-		n, err := conn.Read(*bufPtr)
-		if err != nil {
-			bind.dataBufferPool.Put(bufPtr)
+	wireBuffer := make([]byte, kcpSessionMTU+1)
+	session.kcp = kcp.NewKCP(conv, func(packet []byte, size int) {
+		if size < 0 || size > len(packet) {
+			session.writeErr = errors.New("KCP produced an invalid datagram size")
 			return
 		}
-		if n > 0 {
-			msgBuf := make([]byte, n)
-			copy(msgBuf, (*bufPtr)[:n])
-			msg := &Msg{
-				data:   msgBuf,
-				length: n,
-				addr:   conn.RemoteAddr().(*net.UDPAddr),
+		wirePacket := packet[:size]
+		if options.UnreliableData {
+			wireBuffer[0] = kcpReliableMarker
+			copy(wireBuffer[1:], wirePacket)
+			wirePacket = wireBuffer[:size+1]
+		}
+		_, err := conn.WriteToUDP(wirePacket, session.remote)
+		if err != nil {
+			session.writeErr = err
+		}
+	})
+	if session.kcp.SetMtu(kcpSessionMTU) != 0 {
+		return nil, errors.New("KCP rejected session MTU")
+	}
+	session.kcp.NoDelay(1, 10, 2, tuning.congestion)
+	session.kcp.WndSize(tuning.window, tuning.window)
+	return session, nil
+}
+
+func (session *kcpSession) takeWriteError() error {
+	err := session.writeErr
+	session.writeErr = nil
+	return err
+}
+
+func (state *kcpBindState) updateLoop() {
+	defer state.updater.Done()
+	ticker := time.NewTicker(kcpUpdateInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-state.done:
+			return
+		case <-ticker.C:
+			state.mu.Lock()
+			var sessions []*kcpSession
+			for _, peer := range state.peers {
+				for _, session := range peer.sessions {
+					sessions = append(sessions, session)
+				}
 			}
-			select {
-			case bind.msgChan <- msg:
-			default:
+			state.mu.Unlock()
+			for _, session := range sessions {
+				session.mu.Lock()
+				if !session.retired {
+					session.kcp.Update()
+					session.takeWriteError()
+				}
+				session.mu.Unlock()
 			}
 		}
-		bind.dataBufferPool.Put(bufPtr)
 	}
 }
 
-func (s *KCPExtBind) Open(uport uint16) ([]ReceiveFunc, uint16, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+func (state *kcpBindState) newPeerLocked(remote *net.UDPAddr) *kcpPeer {
+	address := remote.String()
+	peer := state.peers[address]
+	if peer == nil {
+		remoteCopy := *remote
+		remoteCopy.IP = append(net.IP(nil), remote.IP...)
+		peer = &kcpPeer{
+			address:  address,
+			remote:   &remoteCopy,
+			sessions: make(map[uint32]*kcpSession),
+		}
+		state.peers[address] = peer
+	}
+	return peer
+}
 
-	var err error
-	var tries int
+func (state *kcpBindState) newSessionLocked(peer *kcpPeer, conn *net.UDPConn, conv uint32) (*kcpSession, error) {
+	if session := peer.sessions[conv]; session != nil {
+		return session, nil
+	}
+	session, err := newKCPSession(conn, peer.remote, conv, state.options)
+	if err != nil {
+		return nil, err
+	}
+	peer.sessions[conv] = session
+	return session, nil
+}
 
-	if s.ipv4 != nil || s.ipv6 != nil {
+func (state *kcpBindState) retireSessionsLocked(peer *kcpPeer, keep *kcpSession) {
+	for conv, session := range peer.sessions {
+		if session == keep {
+			continue
+		}
+		session.mu.Lock()
+		session.retired = true
+		session.kcp.ReleaseTX()
+		session.mu.Unlock()
+		delete(peer.sessions, conv)
+	}
+	if peer.tx != keep {
+		peer.tx = nil
+	}
+	if peer.preferred != keep {
+		peer.preferred = nil
+	}
+}
+
+func (state *kcpBindState) newOutboundSessionLocked(peer *kcpPeer, conn *net.UDPConn) (*kcpSession, error) {
+	for {
+		var convBytes [4]byte
+		if _, err := rand.Read(convBytes[:]); err != nil {
+			return nil, err
+		}
+		conv := binary.LittleEndian.Uint32(convBytes[:])
+		if peer.sessions[conv] != nil {
+			continue
+		}
+		session, err := state.newSessionLocked(peer, conn, conv)
+		if err != nil {
+			return nil, err
+		}
+		peer.tx, peer.preferred = session, session
+		peer.lastConversation = time.Now()
+		return session, nil
+	}
+}
+
+func (state *kcpBindState) outboundSession(conn *net.UDPConn, remote *net.UDPAddr) (*kcpPeer, *kcpSession, error) {
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if state.closed {
+		return nil, nil, net.ErrClosed
+	}
+	peer := state.newPeerLocked(remote)
+	active := peer.preferred
+	if active == nil {
+		active = peer.tx
+	}
+	if active != nil && time.Since(peer.lastInbound) <= kcpPeerSwitchWindow ||
+		active != nil && time.Since(peer.lastConversation) <= kcpPeerSwitchWindow {
+		return peer, active, nil
+	}
+	state.retireSessionsLocked(peer, nil)
+	session, err := state.newOutboundSessionLocked(peer, conn)
+	return peer, session, err
+}
+
+func kcpPacketHasPush(packet []byte) bool {
+	for offset := 0; offset+kcp.IKCP_OVERHEAD <= len(packet); {
+		command := packet[offset+4]
+		length := uint64(binary.LittleEndian.Uint32(packet[offset+20 : offset+24]))
+		if length > uint64(len(packet)-offset-kcp.IKCP_OVERHEAD) {
+			return false
+		}
+		if command == 81 {
+			return true
+		}
+		offset += kcp.IKCP_OVERHEAD + int(length)
+	}
+	return false
+}
+
+func (state *kcpBindState) inboundSession(conn *net.UDPConn, remote *net.UDPAddr, packet []byte) (*kcpPeer, *kcpSession, bool) {
+	if len(packet) < kcp.IKCP_OVERHEAD {
+		return nil, nil, false
+	}
+	conv := GetConv(packet)
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if state.closed {
+		return nil, nil, false
+	}
+	peer := state.newPeerLocked(remote)
+	session := peer.sessions[conv]
+	created := false
+	if session == nil {
+		if !kcpPacketHasPush(packet) {
+			return nil, nil, false
+		}
+		var err error
+		session, err = state.newSessionLocked(peer, conn, conv)
+		if err != nil {
+			return nil, nil, false
+		}
+		created = true
+	}
+	return peer, session, created
+}
+
+func (state *kcpBindState) noteInbound(peer *kcpPeer, session *kcpSession, created, startsConversation bool, now time.Time) {
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if state.closed || state.peers[peer.address] != peer {
+		return
+	}
+	session.mu.Lock()
+	retired := session.retired
+	session.mu.Unlock()
+	if retired {
+		return
+	}
+	if created && startsConversation && (peer.preferred == nil || now.Sub(peer.lastInbound) > kcpPeerSwitchWindow) {
+		state.retireSessionsLocked(peer, session)
+		peer.preferred = session
+		peer.lastConversation = now
+	}
+	peer.lastInbound = now
+}
+
+func kcpPacketStartsConversation(packet []byte) bool {
+	return len(packet) >= kcp.IKCP_OVERHEAD && packet[4] == 81 && binary.LittleEndian.Uint32(packet[12:16]) == 0
+}
+
+func (state *kcpBindState) readySessions(conn *net.UDPConn) []*kcpSession {
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	var sessions []*kcpSession
+	for _, peer := range state.peers {
+		for _, session := range peer.sessions {
+			if session.conn == conn {
+				sessions = append(sessions, session)
+			}
+		}
+	}
+	return sessions
+}
+
+func (state *kcpBindState) drainReady(conn *net.UDPConn, bufs [][]byte, sizes []int, endpoints []Endpoint) (int, error) {
+	count := 0
+	for _, session := range state.readySessions(conn) {
+		for count < len(bufs) {
+			session.mu.Lock()
+			if session.retired {
+				session.mu.Unlock()
+				break
+			}
+			packetSize := session.kcp.PeekSize()
+			if packetSize <= 0 {
+				err := session.takeWriteError()
+				session.mu.Unlock()
+				if err != nil {
+					return count, err
+				}
+				break
+			}
+			if packetSize > len(bufs[count]) {
+				session.mu.Unlock()
+				if count > 0 {
+					return count, nil
+				}
+				return 0, io.ErrShortBuffer
+			}
+			packetSize = session.kcp.Recv(bufs[count])
+			err := session.takeWriteError()
+			if packetSize > 0 {
+				sizes[count] = packetSize
+				endpoints[count] = &StdNetEndpoint{AddrPort: session.remote.AddrPort()}
+				session.lastActivity = time.Now()
+				count++
+			}
+			session.mu.Unlock()
+			if err != nil {
+				return count, err
+			}
+		}
+		if count == len(bufs) {
+			break
+		}
+	}
+	return count, nil
+}
+
+func (state *kcpBindState) receive(conn *net.UDPConn, readBuffer []byte, bufs [][]byte, sizes []int, endpoints []Endpoint) (int, error) {
+	if len(bufs) == 0 || len(sizes) < len(bufs) || len(endpoints) < len(bufs) {
+		return 0, errors.New("invalid WireGuard receive buffers")
+	}
+	for {
+		select {
+		case <-state.done:
+			return 0, net.ErrClosed
+		default:
+		}
+		if count, err := state.drainReady(conn, bufs, sizes, endpoints); count > 0 || err != nil {
+			return count, err
+		}
+		length, remote, err := conn.ReadFromUDP(readBuffer)
+		if err != nil {
+			select {
+			case <-state.done:
+				return 0, net.ErrClosed
+			default:
+				return 0, err
+			}
+		}
+		packet := readBuffer[:length]
+		if state.options.UnreliableData {
+			if len(packet) == 0 {
+				continue
+			}
+			switch packet[0] {
+			case kcpDataMarker:
+				packet = packet[1:]
+				if !isWireGuardData(packet) {
+					continue
+				}
+				if len(packet) > len(bufs[0]) {
+					return 0, io.ErrShortBuffer
+				}
+				sizes[0] = copy(bufs[0], packet)
+				endpoints[0] = &StdNetEndpoint{AddrPort: remote.AddrPort()}
+				return 1, nil
+			case kcpReliableMarker:
+				packet = packet[1:]
+			default:
+				continue
+			}
+		}
+		peer, session, created := state.inboundSession(conn, remote, packet)
+		if session == nil {
+			continue
+		}
+		now := time.Now()
+		session.mu.Lock()
+		if session.retired {
+			session.mu.Unlock()
+			continue
+		}
+		inputErr := session.kcp.Input(packet, true, false)
+		if inputErr == 0 {
+			session.lastActivity = now
+		}
+		writeErr := session.takeWriteError()
+		session.mu.Unlock()
+		if inputErr == 0 {
+			state.noteInbound(peer, session, created, kcpPacketStartsConversation(packet), now)
+		}
+		if writeErr != nil {
+			return 0, writeErr
+		}
+	}
+}
+
+func (state *kcpBindState) receiveFunc(conn *net.UDPConn) ReceiveFunc {
+	var readMu sync.Mutex
+	readBuffer := make([]byte, kcpMaxPacket)
+	return func(bufs [][]byte, sizes []int, endpoints []Endpoint) (int, error) {
+		readMu.Lock()
+		defer readMu.Unlock()
+		return state.receive(conn, readBuffer, bufs, sizes, endpoints)
+	}
+}
+
+func (bind *KCPExtBind) Open(port uint16) ([]ReceiveFunc, uint16, error) {
+	bind.mu.Lock()
+	defer bind.mu.Unlock()
+	if bind.state != nil {
 		return nil, 0, ErrBindAlreadyOpen
 	}
-again:
-	port := int(uport)
-	var v4conn, v6conn *net.UDPConn
-
-	v4conn, port, err = listenNet("udp4", port)
-	if err != nil && !errors.Is(err, syscall.EAFNOSUPPORT) {
-		return nil, 0, err
+	var ipv4conn, ipv6conn *net.UDPConn
+	var actualPort int
+	var err error
+	for attempt := 0; ; attempt++ {
+		ipv4conn, actualPort, err = listenNet("udp4", int(port))
+		if err != nil && !errors.Is(err, syscall.EAFNOSUPPORT) {
+			return nil, 0, err
+		}
+		ipv6conn, actualPort, err = listenNet("udp6", actualPort)
+		if port == 0 && errors.Is(err, syscall.EADDRINUSE) && attempt < 100 {
+			if ipv4conn != nil {
+				ipv4conn.Close()
+			}
+			continue
+		}
+		if err != nil && !errors.Is(err, syscall.EAFNOSUPPORT) {
+			if ipv4conn != nil {
+				ipv4conn.Close()
+			}
+			return nil, 0, err
+		}
+		break
 	}
-	// Listen on the same port as we're using for ipv4.
-	v6conn, port, err = listenNet("udp6", port)
-	if uport == 0 && errors.Is(err, syscall.EADDRINUSE) && tries < 100 {
-		v4conn.Close()
-		tries++
-		goto again
-	}
-	if err != nil && !errors.Is(err, syscall.EAFNOSUPPORT) {
-		v4conn.Close()
-		return nil, 0, err
-	}
-
-	s.v4listen, err = kcp.ServeConn(nil, 10, 3, v4conn)
-	if err != nil {
-		return nil, 0, err
-	}
-
-	s.v6listen, err = kcp.ServeConn(nil, 10, 3, v6conn)
-	if err != nil {
-		s.v4listen.Close()
-		return nil, 0, err
-	}
-
-	go s.v4loop()
-	go s.v6loop()
-
-	var fns []ReceiveFunc
-	if v4conn != nil {
-		fns = append(fns, s.makeReceiveIPv4(v4conn))
-		s.ipv4 = v4conn
-	}
-	if v6conn != nil {
-		fns = append(fns, s.makeReceiveIPv6(v6conn))
-
-		s.ipv6 = v6conn
-	}
-	if len(fns) == 0 {
+	if ipv4conn == nil && ipv6conn == nil {
 		return nil, 0, syscall.EAFNOSUPPORT
 	}
-
-	return fns, uint16(port), nil
-}
-
-func (s *KCPExtBind) putMessages(msgs *[]ipv6.Message) {
-	for i := range *msgs {
-		(*msgs)[i].OOB = (*msgs)[i].OOB[:0]
-		(*msgs)[i] = ipv6.Message{Buffers: (*msgs)[i].Buffers, OOB: (*msgs)[i].OOB}
-	}
-	s.msgsPool.Put(msgs)
-}
-
-func (s *KCPExtBind) getMessages() *[]ipv6.Message {
-	return s.msgsPool.Get().(*[]ipv6.Message)
-}
-
-var (
-	// If compilation fails here these are no longer the same underlying type.
-	_ ipv6.Message = ipv4.Message{}
-)
-
-func (s *KCPExtBind) receiveIP(
-	conn *net.UDPConn,
-	bufs [][]byte,
-	sizes []int,
-	eps []Endpoint,
-) (n int, err error) {
-	msgs := s.getMessages()
-	for i := range bufs {
-		(*msgs)[i].Buffers[0] = bufs[i]
-		(*msgs)[i].OOB = (*msgs)[i].OOB[:cap((*msgs)[i].OOB)]
-	}
-	defer s.putMessages(msgs)
-	var numMsgs int = 0
-	recv := <-s.msgChan
-	msg := &(*msgs)[numMsgs]
-
-	if recv.closed {
-		for len(s.msgChan) > 0 {
-			<-s.msgChan
+	for _, socket := range []*net.UDPConn{ipv4conn, ipv6conn} {
+		if socket == nil {
+			continue
 		}
-		return 0, net.ErrClosed
-	}
-
-	msg.Addr = recv.addr
-	copy(msg.Buffers[0], recv.data)
-	msg.N = recv.length
-	msg.NN = 0
-
-	sizes[numMsgs] = recv.length
-	if sizes[numMsgs] == 0 {
-		return numMsgs, nil
-	}
-	addrPort := msg.Addr.(*net.UDPAddr).AddrPort()
-	ep := &StdNetEndpoint{AddrPort: addrPort} // TODO: remove allocation
-	getSrcFromControl(msg.OOB[:msg.NN], ep)
-	eps[numMsgs] = ep
-	numMsgs++
-	return numMsgs, nil
-}
-
-func (s *KCPExtBind) makeReceiveIPv4(conn *net.UDPConn) ReceiveFunc {
-	return func(bufs [][]byte, sizes []int, eps []Endpoint) (n int, err error) {
-		return s.receiveIP(conn, bufs, sizes, eps)
-	}
-}
-
-func (s *KCPExtBind) makeReceiveIPv6(conn *net.UDPConn) ReceiveFunc {
-	return func(bufs [][]byte, sizes []int, eps []Endpoint) (n int, err error) {
-		return s.receiveIP(conn, bufs, sizes, eps)
-	}
-}
-
-// TODO: When all Binds handle IdealBatchSize, remove this dynamic function and
-// rename the IdealBatchSize constant to BatchSize.
-func (s *KCPExtBind) BatchSize() int {
-	if runtime.GOOS == "linux" || runtime.GOOS == "android" {
-		return IdealBatchSize
-	}
-	return 1
-}
-
-func (s *KCPExtBind) Close() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	var err1, err2 error
-
-	if s.v4listen != nil {
-		err1 = s.v4listen.Close()
-		s.v4listen = nil
-	}
-	if s.v6listen != nil {
-		err2 = s.v6listen.Close()
-		s.v6listen = nil
-	}
-	if s.ipv4 != nil {
-		err1 = s.ipv4.Close()
-		s.ipv4 = nil
-	}
-	if s.ipv6 != nil {
-		err2 = s.ipv6.Close()
-		s.ipv6 = nil
-	}
-	s.blackhole4 = false
-	s.blackhole6 = false
-	s.ipv4TxOffload = false
-	s.ipv4RxOffload = false
-	s.ipv6TxOffload = false
-	s.ipv6RxOffload = false
-
-	s.sessions.Range(func(key, value any) bool {
-		if sess, ok := value.(*kcp.UDPSession); ok {
-			sess.Close()
+		bufferErr := errors.Join(disableKCPGRO(socket), socket.SetReadBuffer(kcpSocketBufferSize), socket.SetWriteBuffer(kcpSocketBufferSize))
+		if bufferErr != nil {
+			if ipv4conn != nil {
+				ipv4conn.Close()
+			}
+			if ipv6conn != nil {
+				ipv6conn.Close()
+			}
+			return nil, 0, bufferErr
 		}
-		return true
-	})
-
-	s.sessions.Clear()
-
-	if err1 != nil {
-		return err1
 	}
-	return err2
+	state := &kcpBindState{done: make(chan struct{}), peers: make(map[string]*kcpPeer), options: bind.options}
+	bind.ipv4, bind.ipv6, bind.state = ipv4conn, ipv6conn, state
+	var receives []ReceiveFunc
+	if ipv4conn != nil {
+		receives = append(receives, state.receiveFunc(ipv4conn))
+	}
+	if ipv6conn != nil {
+		receives = append(receives, state.receiveFunc(ipv6conn))
+	}
+	state.updater.Add(1)
+	go state.updateLoop()
+	return receives, uint16(actualPort), nil
 }
 
-func (s *KCPExtBind) Send(bufs [][]byte, endpoint Endpoint) error {
-	s.mu.Lock()
-	blackhole := s.blackhole4
-	conn := s.ipv4
-	offload := s.ipv4TxOffload
-	is6 := false
+func (*KCPExtBind) BatchSize() int { return 1 }
+
+func (bind *KCPExtBind) Close() error {
+	bind.mu.Lock()
+	state := bind.state
+	if state == nil {
+		bind.mu.Unlock()
+		return nil
+	}
+	state.mu.Lock()
+	state.closed = true
+	close(state.done)
+	state.mu.Unlock()
+	ipv4conn, ipv6conn := bind.ipv4, bind.ipv6
+	bind.ipv4, bind.ipv6, bind.state = nil, nil, nil
+	bind.blackhole4, bind.blackhole6 = false, false
+	bind.mu.Unlock()
+	var closeErrors []error
+	if ipv4conn != nil {
+		closeErrors = append(closeErrors, ipv4conn.Close())
+	}
+	if ipv6conn != nil {
+		closeErrors = append(closeErrors, ipv6conn.Close())
+	}
+	state.updater.Wait()
+	return errors.Join(closeErrors...)
+}
+
+func (bind *KCPExtBind) Send(packets [][]byte, endpoint Endpoint) error {
+	bind.mu.Lock()
+	state, ipv4conn, ipv6conn := bind.state, bind.ipv4, bind.ipv6
+	blackhole := bind.blackhole4
+	conn := ipv4conn
 	if endpoint.DstIP().Is6() {
-		blackhole = s.blackhole6
-		conn = s.ipv6
-		is6 = true
-		offload = s.ipv6TxOffload
+		blackhole = bind.blackhole6
+		conn = ipv6conn
 	}
-	s.mu.Unlock()
-
+	bind.mu.Unlock()
+	if state == nil {
+		return net.ErrClosed
+	}
 	if blackhole {
 		return nil
 	}
 	if conn == nil {
 		return syscall.EAFNOSUPPORT
 	}
-
-	msgs := s.getMessages()
-	defer s.putMessages(msgs)
-	ua := s.udpAddrPool.Get().(*net.UDPAddr)
-	defer s.udpAddrPool.Put(ua)
-	if is6 {
-		as16 := endpoint.DstIP().As16()
-		copy(ua.IP, as16[:])
-		ua.IP = ua.IP[:16]
-	} else {
-		as4 := endpoint.DstIP().As4()
-		copy(ua.IP, as4[:])
-		ua.IP = ua.IP[:4]
+	stdEndpoint, ok := endpoint.(*StdNetEndpoint)
+	if !ok {
+		return errors.New("unsupported KCP endpoint type")
 	}
-	ua.Port = int(endpoint.(*StdNetEndpoint).Port())
-	var (
-		retried bool
-		err     error
-	)
-retry:
-	if offload {
-		n := coalesceMessages(ua, endpoint.(*StdNetEndpoint), bufs, *msgs, setGSOSize)
-		err = s.send(conn, (*msgs)[:n])
-		if err != nil && offload && errShouldDisableUDPGSO(err) {
-			offload = false
-			s.mu.Lock()
-			if is6 {
-				s.ipv6TxOffload = false
-			} else {
-				s.ipv4TxOffload = false
+	remote := net.UDPAddrFromAddrPort(stdEndpoint.AddrPort)
+	if state.options.UnreliableData {
+		var reliable [][]byte
+		var wireBuffer []byte
+		for _, packet := range packets {
+			if !isWireGuardData(packet) {
+				reliable = append(reliable, packet)
+				continue
 			}
-			s.mu.Unlock()
-			retried = true
-			goto retry
+			if len(packet) > 65506 {
+				return errors.New("WireGuard data exceeds hybrid UDP datagram limit")
+			}
+			if cap(wireBuffer) < len(packet)+1 {
+				wireBuffer = make([]byte, len(packet)+1)
+			}
+			wirePacket := wireBuffer[:len(packet)+1]
+			wirePacket[0] = kcpDataMarker
+			copy(wirePacket[1:], packet)
+			if _, err := conn.WriteToUDP(wirePacket, remote); err != nil {
+				return err
+			}
 		}
-	} else {
-		for i := range bufs {
-			(*msgs)[i].Addr = ua
-			(*msgs)[i].Buffers[0] = bufs[i]
-			setSrcControl(&(*msgs)[i].OOB, endpoint.(*StdNetEndpoint))
+		packets = reliable
+		if len(packets) == 0 {
+			select {
+			case <-state.done:
+				return net.ErrClosed
+			default:
+				return nil
+			}
 		}
-		err = s.send(conn, (*msgs)[:len(bufs)])
 	}
-	if retried {
-		return ErrUDPGSODisabled{onLaddr: conn.LocalAddr().String(), RetryErr: err}
+	for {
+		_, session, err := state.outboundSession(conn, remote)
+		if err != nil {
+			return err
+		}
+		session.mu.Lock()
+		if session.retired {
+			session.mu.Unlock()
+			continue
+		}
+		tuning, _ := state.options.tuning()
+		if session.kcp.WaitSnd() >= 2*tuning.window {
+			session.mu.Unlock()
+			timer := time.NewTimer(kcpUpdateInterval)
+			select {
+			case <-state.done:
+				timer.Stop()
+				return net.ErrClosed
+			case <-timer.C:
+				continue
+			}
+		}
+		select {
+		case <-state.done:
+			session.mu.Unlock()
+			return net.ErrClosed
+		default:
+		}
+		for _, packet := range packets {
+			if len(packet) == 0 || len(packet) > kcpMaxPacket {
+				session.mu.Unlock()
+				return errors.New("invalid KCP packet length")
+			}
+			if session.kcp.Send(packet) != 0 {
+				session.mu.Unlock()
+				return errors.New("KCP rejected packet")
+			}
+		}
+		session.lastActivity = time.Now()
+		session.kcp.Update()
+		err = session.takeWriteError()
+		session.mu.Unlock()
+		return err
 	}
-	return err
 }
 
-func (s *KCPExtBind) send(conn *net.UDPConn, msgs []ipv6.Message) error {
-	var (
-		sess *kcp.UDPSession
-		err  error
-	)
-	for _, msg := range msgs {
-		addrStr := msg.Addr.String()
-		if val, ok := s.sessions.Load(addrStr); ok {
-			sess = val.(*kcp.UDPSession)
-		} else {
-			sess, err = kcp.NewConn2(msg.Addr, nil, 10, 3, conn)
-			if err == nil {
-				sess.SetWriteDelay(false)
-				sess.SetNoDelay(1, 10, 2, 1)
-				sess.SetMtu(mtuLimit)
-				sess.SetWindowSize(4096, 4096)
-				sess.SetACKNoDelay(true)
-				s.sessions.Store(addrStr, sess)
-			}
-		}
-		if sess != nil && err == nil {
-			_, err = sess.Write(msg.Buffers[0])
-		}
-	}
-	return err
+func isWireGuardData(packet []byte) bool {
+	return len(packet) >= 32 && binary.LittleEndian.Uint32(packet[:4]) == 4
 }

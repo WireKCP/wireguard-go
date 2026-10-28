@@ -10,6 +10,8 @@ package conn
 
 import "net"
 
+func disableKCPGRO(conn *net.UDPConn) error { return nil }
+
 func supportsUDPOffload(conn *net.UDPConn) (txOffload, rxOffload bool) {
 	return
 }
